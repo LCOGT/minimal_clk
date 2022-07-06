@@ -5,7 +5,7 @@
 
 /*
 minimal_clock.c
-2014-05-20
+2022-07-05
 Public Domain
 */
 
@@ -31,15 +31,15 @@ gpio44 GPCLK1 ALT0 Compute module only (reserved for system use)
 
 Clock sources
 
-0     0 Hz     Ground
-1     19.2 MHz oscillator 
-2     0 Hz     testdebug0
-3     0 Hz     testdebug1
-4     0 Hz     PLLA
-5     1000 MHz PLLC (changes with overclock settings)
-6     500 MHz  PLLD
-7     216 MHz  HDMI auxiliary
-8-15  0 Hz     Ground
+0     0 Hz                    Ground
+1     19.2 MHz / 54 Mhz (Pi4) oscillator 
+2     0 Hz                    testdebug0
+3     0 Hz                    testdebug1
+4     0 Hz                    PLLA
+5     1000 MHz                PLLC (changes with overclock settings)
+6     500 MHz  / 750MHz (Pi4) PLLD
+7     216 MHz                 HDMI auxiliary
+8-15  0 Hz                    Ground
 
 The integer divider may be 2-4095.
 The fractional divider may be 0-4095.
@@ -59,6 +59,7 @@ There is no 25MHz cap for using non-zero MASH
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <arpa/inet.h>
 
 static volatile uint32_t piModel = 1;
 
@@ -115,9 +116,14 @@ static volatile uint32_t piBusAddr = 0x40000000;
 
 #define CLK_SRCS 4
 
-#define CLK_CTL_SRC_OSC  1  /* 19.2 MHz */
+static double cfreq[CLK_SRCS]={500e6, 19.2e6, 216e6, 1000e6};
+static char *clocks[CLK_SRCS]={"PLLD", " OSC", "HDMI", "PLLC"};
+static double clk_min_freq = 4687.5;
+static double clk_max_freq = 250e6;
+
+#define CLK_CTL_SRC_OSC  1  /* 19.2 MHz or 54 MHz (Pi4)*/
 #define CLK_CTL_SRC_PLLC 5  /* 1000 MHz */
-#define CLK_CTL_SRC_PLLD 6  /*  500 MHz */
+#define CLK_CTL_SRC_PLLD 6  /*  500 MHz  or 750 MHz (Pi4)*/
 #define CLK_CTL_SRC_HDMI 7  /*  216 MHz */
 
 #define CLK_DIV_DIVI(x) ((x)<<12)
@@ -241,11 +247,8 @@ unsigned gpioHardwareRevision(void)
    FILE * filp;
    char buf[512];
    char term;
-   int chars=4; /* number of chars in revision string */
 
    if (rev) return rev;
-
-   piModel = 0;
 
    filp = fopen ("/proc/cpuinfo", "r");
 
@@ -253,39 +256,85 @@ unsigned gpioHardwareRevision(void)
    {
       while (fgets(buf, sizeof(buf), filp) != NULL)
       {
-         if (piModel == 0)
+         if (!strncasecmp("revision\t:", buf, 10))
          {
-            if (!strncasecmp("model name", buf, 10))
-            {
-               if (strstr (buf, "ARMv6") != NULL)
-               {
-                  piModel = 1;
-                  chars = 4;
-                  piPeriphBase = 0x20000000;
-                  piBusAddr = 0x40000000;
-               }
-               else if (strstr (buf, "ARMv7") != NULL)
-               {
-                  piModel = 2;
-                  chars = 6;
-                  piPeriphBase = 0x3F000000;
-                  piBusAddr = 0xC0000000;
-               }
-            }
-         }
-
-         if (!strncasecmp("revision", buf, 8))
-         {
-            if (sscanf(buf+strlen(buf)-(chars+1),
-               "%x%c", &rev, &term) == 2)
+            if (sscanf(buf+10, "%x%c", &rev, &term) == 2)
             {
                if (term != '\n') rev = 0;
             }
          }
       }
-
       fclose(filp);
    }
+
+   if (rev == 0)
+   {
+      /* (some) arm64 operating systems get revision number here  */
+      filp = fopen ("/proc/device-tree/system/linux,revision", "r");
+
+      if (filp != NULL)
+      {
+         uint32_t tmp;
+         if (fread(&tmp,1 , 4, filp) == 4)
+         {
+            /*
+               for some reason the value returned by reading
+               this /proc entry seems to be big endian,
+               convert it.
+            */
+            rev = ntohl(tmp);
+         }
+         fclose(filp);
+      }
+   }
+
+   rev &= 0xFFFFFF; /* mask out warranty bit */
+
+   /* Decode revision code */
+
+   if ((rev & 0x800000) == 0) /* old rev code */
+   {
+      if ((rev > 0) && (rev < 0x0016)) /* all BCM2835 */
+      {
+         piPeriphBase = 0x20000000;
+         piBusAddr  = 0x40000000;
+      }
+      else
+      {
+         rev = 0;
+      }
+   }
+   else /* new rev code */
+   {
+      switch ((rev >> 12) & 0xF)  /* just interested in BCM model */
+      {
+
+         case 0x0:   /* BCM2835 */
+            piPeriphBase = 0x20000000;
+            piBusAddr  = 0x40000000;
+            break;
+
+         case 0x1:   /* BCM2836 */
+         case 0x2:   /* BCM2837 */
+            piPeriphBase = 0x3F000000;
+            piBusAddr  = 0xC0000000;
+            break;
+
+         case 0x3:   /* BCM2711 */
+            piPeriphBase = 0xFE000000;
+            piBusAddr  = 0xC0000000;
+            cfreq[0] = 750e6;
+            cfreq[1] = 54e6;
+            clk_min_freq = 13184.0;
+            clk_max_freq = 375e6;
+            break;
+
+         default:
+            rev = 0;
+            break;
+      }
+   }
+
    return rev;
 }
 
@@ -435,7 +484,7 @@ void usage()
       "\n" \
       "Usage: minimal_clk x.x[KM] [OPTION]...\n" \
       "       minimal_clk x.xD [OPTION]...\n\n" \
-      "    x.x, frequency, must be between 4.6875 KHz and 500 MHz.\n"\
+      "    x.x, frequency, must be between %7.2f KHz and %7.2f MHz.\n"\
       "    K kilo multiplier\n"\
       "    M mega multiplier\n\n"\
       "    x.xD, divider, must be 2.0 or greater and less than 4096.\n\n"\
@@ -449,6 +498,7 @@ void usage()
       "minimal_clk  234.179d\n" \
       "  Sets integer divider to 234 and fractional divider to 733.\n" \
       "\n",
+      clk_min_freq / 1e3, clk_max_freq / 1e6,
       OPT_C_1, OPT_C_2, OPT_C_DEF,
       OPT_M_F, OPT_M_L, OPT_M_DEF,
       OPT_S_1, OPT_S_2, OPT_S_3, OPT_S_4, OPT_S_DEF
@@ -524,9 +574,9 @@ int main(int argc, char *argv[])
    int i, non_options;
    double freq, div, f;
    char *endptr;
-   double cfreq[CLK_SRCS]={500e6, 19.2e6, 216e6, 1000e6};
-   char *clocks[CLK_SRCS]={"PLLD", " OSC", "HDMI", "PLLC"};
    int divI[CLK_SRCS], divF[CLK_SRCS];
+
+   gpioHardwareRevision();
 
    /* command line parameters */
 
@@ -565,7 +615,7 @@ int main(int argc, char *argv[])
             freq *= 1000.0;
 
          case 0:
-            if ((freq < 4687.5) || (freq > 500e6)) {usage(); exit(-1);}
+            if ((freq < clk_min_freq) || (freq > clk_max_freq)) {usage(); exit(-1);}
 
             for (i=0; i<CLK_SRCS; i++)
             {
@@ -599,7 +649,7 @@ int main(int argc, char *argv[])
          if ((divI[i]<2) || (divI[i]>4095)) printf("ILLEGAL\n");
          else
          {
-            div = divI[i] + (divF[i] / 4096);
+            div = divI[i] + (divF[i] / 4096.0);
             f = cfreq[i]/div;
             if      (f > 1000000.0) printf("%7.2f MHz\n", f/1000000.0);
             else if (f > 1000.0)    printf("%7.2f KHz\n", f/1000.0);
